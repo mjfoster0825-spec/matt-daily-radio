@@ -1,0 +1,223 @@
+name: Publish Matt Daily Radio
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 5:30pm Pacific Standard Time / 6:30pm Pacific Daylight Time.
+    - cron: "30 1 * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: matt-daily-radio
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: Checkout public repository
+        uses: actions/checkout@v4
+      - name: Prepare Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install free speech tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq espeak-ng ffmpeg
+          python -m pip install --disable-pip-version-check kokoro==0.9.4 soundfile==0.13.1 numpy
+      - name: Prepare complete verified-edition audio builder
+        run: |
+          mkdir -p scripts public
+          cat > scripts/build_radio.py <<'RADIO_BUILDER_SOURCE'
+          #!/usr/bin/env python3
+          """Build Matt Daily Radio MP3 and RSS from a complete, verified newspaper edition.
+          
+          Free self-hosted Kokoro-82M inference. No tokens or paid speech APIs.
+          Intended to run in GitHub Actions on a *public* repo, with Pages publishing.
+          """
+          from __future__ import annotations
+          import argparse, datetime as dt, html, io, json, os, pathlib, re, subprocess, sys, urllib.request, wave, xml.etree.ElementTree as ET
+          from email.utils import format_datetime
+          
+          ROOT = pathlib.Path(__file__).resolve().parents[1]
+          PUBLIC = ROOT / 'public'
+          WEBSITE = 'https://the-matt-daily-journal.vercel.app'
+          DEFAULT_PAGES = 'https://mjfoster0825-spec.github.io/matt-daily-radio'
+          RSS_FILE = 'podcast.xml'
+          
+          
+          def fetch_json(path):
+              req=urllib.request.Request(WEBSITE+path,headers={'User-Agent':'MattDailyRadioBuilder/1.0'})
+              with urllib.request.urlopen(req,timeout=45) as r: return json.load(r)
+          
+          
+          def latest_edition():
+              manifest=fetch_json('/feed/manifest.json')
+              entries=manifest.get('editions',[])
+              if not entries: raise ValueError('No published editions; refusing to generate invented news')
+              dates=sorted([e['date'] for e in entries],reverse=True)
+              d=dates[0]
+              if not re.fullmatch(r'20\d{2}-\d{2}-\d{2}',d): raise ValueError('Malformed edition date')
+              edition=fetch_json('/feed/'+d+'.json')
+              articles=edition.get('articles',[])
+              if edition.get('date')!=d or len(articles)<12: raise ValueError('Incomplete published issue')
+              words=sum(len(' '.join(a.get('paragraphs',[])).split()) for a in articles)
+              if words<10000 or any(not a.get('sources') or not a.get('paragraphs') for a in articles):
+                  raise ValueError('Edition failed word-count or attribution requirement')
+              return edition,words
+          
+          
+          def briefing(edition,minutes=12):
+              """Create a short digest of quoted published article text, no fabricated summaries."""
+              a=edition['articles'];order=['front','capital','maga','liberation','planet','local','science','hope','sports','weird'];selected=[];used=set()
+              for sec in order:
+                  match=next((x for x in a if x.get('section')==sec and x['id'] not in used),None)
+                  if match:selected.append(match);used.add(match['id'])
+              for article in a:
+                  if len(selected)>=8:break
+                  if article['id'] not in used:selected.append(article);used.add(article['id'])
+              max_words=round(minutes*145)
+              chunks=['The Matt Daily Radio. '+dt.date.fromisoformat(edition['date']).strftime('%B %d, %Y')+'. This is the Essential Briefing, drawn directly from our published newspaper. News reporting, analysis and opinion are distinguished in the full edition. See the linked sources on the website.']
+              metadata=[];used_words=len(chunks[0].split())
+              for article in selected:
+                  intro=(article.get('sectionName','News')+'. '+article['title']+'. ')
+                  paras=[]
+                  for p in article.get('paragraphs',[])[:3]:
+                      if used_words+len(intro.split())+len(p.split())>max_words: break
+                      paras.append(p);used_words+=len(p.split())
+                  if not paras:continue
+                  chunks.append(intro+' '.join(paras))
+                  used_words+=len(intro.split());metadata.append(article['id'])
+              chunks.append('You have reached the end of your Matt Daily Radio briefing. Stay curious. Stay engaged. And get back to your day.')
+              return chunks,metadata
+          
+          
+          def synthesize(chapters,mp3_path,voice='am_michael'):
+              """Kokoro generates audio in-process on GitHub runner, then ffmpeg encodes MP3."""
+              import numpy as np
+              import soundfile as sf
+              from kokoro import KPipeline
+              pipeline=KPipeline(lang_code='a')
+              sr=24000
+              temp=mp3_path.with_suffix('.wav')
+              with sf.SoundFile(temp,mode='w',samplerate=sr,channels=1,subtype='PCM_16') as w:
+                  for i,chapter in enumerate(chapters):
+                      for _,_,audio in pipeline(chapter,voice=voice,speed=1.05,split_pattern=r'\n+'):
+                          audio=np.asarray(audio,dtype=np.float32)
+                          if len(audio): w.write(audio)
+                      w.write(np.zeros(round(0.52*sr),dtype=np.float32))
+                      print('Generated',i+1,'of',len(chapters),'chapters')
+              subprocess.run(['ffmpeg','-y','-loglevel','error','-i',str(temp),'-codec:a','libmp3lame','-ac','1','-ar','24000','-b:a','48k','-metadata','artist=The Matt Daily','-metadata','genre=News & Politics',str(mp3_path)],check=True)
+              temp.unlink(missing_ok=True)
+              p=subprocess.check_output(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nokey=1:noprint_wrappers=1',str(mp3_path)]).decode().strip()
+              return round(float(p))
+          
+          
+          def xml_feed(episodes,pages_url):
+              ns_it='http://www.itunes.com/dtds/podcast-1.0.dtd';ns_atom='http://www.w3.org/2005/Atom'
+              ET.register_namespace('itunes',ns_it);ET.register_namespace('atom',ns_atom)
+              root=ET.Element('rss',{'version':'2.0'});ch=ET.SubElement(root,'channel')
+              def field(tag,val,parent=ch):ET.SubElement(parent,tag).text=str(val)
+              field('title','The Matt Daily Radio');field('link',WEBSITE+'/#/radio')
+              field('description','The Matt Daily: Power. People. Planet. Original sourced reporting and clearly labeled opinion. A finite daily briefing.')
+              field('language','en-us');field(f'{{{ns_it}}}author','The Matt Daily');field(f'{{{ns_it}}}explicit','false')
+              ET.SubElement(ch,f'{{{ns_it}}}category',{'text':'News'})
+              ET.SubElement(ch,f'{{{ns_atom}}}link',{'href':WEBSITE+'/api/radio-podcast','rel':'self','type':'application/rss+xml'})
+              for e in episodes:
+                  it=ET.SubElement(ch,'item')
+                  field('title',e['title'],it);field('description',e['description'],it);field('link',WEBSITE+'/#/radio',it)
+                  ET.SubElement(it,'guid',{'isPermaLink':'false'}).text=e['id']
+                  field('pubDate',format_datetime(dt.datetime.fromisoformat(e['publishedAt'].replace('Z','+00:00'))),it)
+                  ET.SubElement(it,'enclosure',{'url':e['audioUrl'],'length':str(e['bytes']),'type':'audio/mpeg'})
+                  field(f'{{{ns_it}}}duration',e['duration'],it);field(f'{{{ns_it}}}explicit','false',it)
+              return ET.tostring(root,encoding='utf-8',xml_declaration=True)
+          
+          
+          def restore_prior_episodes(pages_url, limit=21):
+              """Carry forward existing MP3s when Actions runs in a new ephemeral VM."""
+              url=pages_url.rstrip('/')+'/episodes.json'
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'MattDailyRadioBuilder/1.0'}),timeout=20) as r: prior=json.load(r)
+                  entries=prior.get('episodes',[])[:limit]
+                  restored=[]
+                  for item in entries:
+                      identifier=item.get('id','')
+                      if not re.fullmatch(r'20\d{2}-\d{2}-\d{2}-[a-z0-9-]+',identifier):continue
+                      audio_url=item.get('audioUrl','')
+                      if not audio_url.startswith(pages_url.rstrip('/')+'/'):continue
+                      try:
+                          target=PUBLIC/(identifier+'.mp3')
+                          if not target.exists():
+                              with urllib.request.urlopen(audio_url,timeout=80) as r:
+                                  with target.open('wb') as w:
+                                      while True:
+                                          chunk=r.read(1048576)
+                                          if not chunk:break
+                                          w.write(chunk)
+                              if not 10000<=target.stat().st_size<=100_000_000:raise ValueError('Invalid audio size')
+                          transcript=PUBLIC/(identifier+'.txt')
+                          if not transcript.exists():
+                              with urllib.request.urlopen(pages_url.rstrip('/')+'/'+identifier+'.txt',timeout=30) as r:
+                                  transcript.write_bytes(r.read(4_000_000))
+                          restored.append(item)
+                      except Exception as exc:
+                          print('Could not restore previous audio',identifier,exc)
+                          target.unlink(missing_ok=True)
+                  print('Preserved',len(restored),'older podcast episodes')
+                  (PUBLIC/'episodes.json').write_text(json.dumps({'schemaVersion':1,'episodes':restored},ensure_ascii=False,indent=2))
+              except Exception as exc:
+                  print('No previous GitHub Pages podcast found (normal on first run):',exc)
+          
+          
+          def main():
+              p=argparse.ArgumentParser();p.add_argument('--minutes',type=int,default=12);p.add_argument('--voice',default='am_michael');p.add_argument('--pages-url',default=DEFAULT_PAGES);p.add_argument('--retention',type=int,default=21)
+              args=p.parse_args();PUBLIC.mkdir(exist_ok=True)
+              restore_prior_episodes(args.pages_url,args.retention)
+              edition,words=latest_edition();date=edition['date'];id=date+'-essential-briefing'
+              existing_file=PUBLIC/'episodes.json'
+              feed=json.loads(existing_file.read_text()) if existing_file.exists() else {'schemaVersion':1,'episodes':[]}
+              if any(e.get('id')==id for e in feed['episodes']):
+                  print('Already published',id,'â skip generation');
+                  (PUBLIC/'podcast.xml').write_bytes(xml_feed(feed['episodes'],args.pages_url));return 0
+              chapters,article_ids=briefing(edition,args.minutes)
+              if len(chapters)<3: raise ValueError('Not enough published body text for briefing')
+              outfile=PUBLIC/(id+'.mp3')
+              duration=synthesize(chapters,outfile,args.voice)
+              (PUBLIC/(id+'.txt')).write_text('\n\n'.join(chapters),encoding='utf-8')
+              episode={'id':id,'date':date,'title':'The Matt Daily â Essential Briefing Â· '+date,'subtitle':'Published newspaper narrated with open-source Kokoro','description':f'Essential narrated briefing from {date}. Original {words:,}-word newspaper. Source links and editorial evidence notes at The Matt Daily.',
+                'duration':duration,'bytes':outfile.stat().st_size,'audioUrl':args.pages_url.rstrip('/')+'/'+outfile.name,
+                'transcriptUrl':args.pages_url.rstrip('/')+'/'+id+'.txt','voice':'Kokoro '+args.voice,'type':'essential','archived':True,'articleIds':article_ids,'publishedAt':dt.datetime.now(dt.timezone.utc).isoformat()}
+              episodes=[episode]+feed['episodes'];episodes=episodes[:args.retention]
+              keep=set(e['id'] for e in episodes)
+              for x in PUBLIC.glob('20??-??-??-*.mp3'):
+                  if x.stem not in keep:x.unlink()
+              for x in PUBLIC.glob('20??-??-??-*.txt'):
+                  if x.stem not in keep:x.unlink()
+              data={'schemaVersion':1,'updatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'episodes':episodes}
+              (PUBLIC/'episodes.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+              (PUBLIC/'podcast.xml').write_bytes(xml_feed(episodes,args.pages_url))
+              print('Built',outfile.name,'seconds',duration,'bytes',outfile.stat().st_size)
+              return 0
+          if __name__=='__main__':sys.exit(main())
+          RADIO_BUILDER_SOURCE
+          printf '<!doctype html><html lang="en"><meta charset="utf-8"><title>The Matt Daily Radio</title><h1>The Matt Daily Radio</h1><p>Listen at <a href="https://the-matt-daily-journal.vercel.app/#/radio">The Matt Daily</a>.</p></html>' > public/index.html
+      - name: Create Kokoro Essential Briefing
+        run: python scripts/build_radio.py --minutes 12 --voice am_michael
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload radio episodes and podcast feed
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - name: Publish radio on GitHub Pages
+        id: publish
+        uses: actions/deploy-pages@v4
