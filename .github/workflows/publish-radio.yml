@@ -39,7 +39,7 @@ jobs:
           curl --fail --location --retry 3 --silent --show-error \
             https://the-matt-daily-journal.vercel.app/radio/build_radio.py \
             -o scripts/build_radio.py
-          echo 'c7b4683bbee4eacfa41c9aefab1d2b12557ad1d001cc9d251013398da16975a3  scripts/build_radio.py' | sha256sum --check
+                    echo '1e7a97756e240bf3d25ed805bf9b2375b0766b09a480c86bbcba3402fa9281c9  scripts/build_radio.py' | sha256sum --check
           python -m py_compile scripts/build_radio.py
       - name: Create Kokoro Essential Briefing
         run: python scripts/build_radio.py --minutes 12 --voice am_michael
